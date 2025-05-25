@@ -1,0 +1,122 @@
+import pandas as pd
+import numpy as np
+import os
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from tqdm import tqdm
+
+TRAIN_CSV = '/run/media/ayush/New Volume/SOIL/soil_classification-2025/train_labels.csv'
+TEST_CSV = '/run/media/ayush/New Volume/SOIL/soil_classification-2025/test_ids.csv'
+TRAIN_DIR = '/run/media/ayush/New Volume/SOIL/soil_classification-2025/train'
+TEST_DIR = '/run/media/ayush/New Volume/SOIL/soil_classification-2025/test'
+IMG_SIZE = (224, 224)
+
+train_df = pd.read_csv(TRAIN_CSV)
+train_df['filename'] = train_df['image_id'].astype(str)
+labels = sorted(train_df['soil_type'].unique())
+label_to_index = {label: idx for idx, label in enumerate(labels)}
+index_to_label = {v: k for k, v in label_to_index.items()}
+train_df['label_idx'] = train_df['soil_type'].map(label_to_index)
+
+X, y = [], []
+for _, row in tqdm(train_df.iterrows(), total=len(train_df)):
+    img_path = os.path.join(TRAIN_DIR, row['filename'])
+    try:
+        img = load_img(img_path, target_size=IMG_SIZE)
+        img = img_to_array(img) / 255.0
+        X.append(img)
+        y.append(row['label_idx'])
+    except Exception as e:
+        print(f"Error loading image: {img_path} - {e}")
+
+X = np.array(X)
+y = to_categorical(y, num_classes=len(labels))
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, stratify=train_df['label_idx'], random_state=42
+)
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+datagen = ImageDataGenerator(
+    rotation_range=20,
+    horizontal_flip=True,
+    vertical_flip=True,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.1
+)
+datagen.fit(X_train)
+
+base_model = tf.keras.applications.InceptionV3(
+    include_top=False, weights='imagenet', input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)
+)
+base_model.trainable = False
+
+model = tf.keras.Sequential([
+    base_model,
+    tf.keras.layers.GlobalAveragePooling2D(),
+    tf.keras.layers.Dropout(0.5),
+    tf.keras.layers.Dense(len(labels), activation='softmax')
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+checkpoint = tf.keras.callbacks.ModelCheckpoint('best_model.h5', save_best_only=True)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+
+history = model.fit(
+    datagen.flow(X_train, y_train, batch_size=32),
+    validation_data=(X_val, y_val),
+    epochs=15,
+    callbacks=[early_stop, checkpoint, reduce_lr]
+)
+
+base_model.trainable = True
+fine_tune_at = 249
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+fine_tune_history = model.fit(
+    datagen.flow(X_train, y_train, batch_size=16),
+    validation_data=(X_val, y_val),
+    epochs=15,
+    callbacks=[early_stop, checkpoint, reduce_lr]
+)
+
+model.load_weights('best_model.h5')
+
+y_pred_val = model.predict(X_val)
+y_true_val = np.argmax(y_val, axis=1)
+y_pred_val_classes = np.argmax(y_pred_val, axis=1)
+print(classification_report(y_true_val, y_pred_val_classes, target_names=labels))
+
+test_df = pd.read_csv(TEST_CSV)
+test_df['filename'] = test_df['image_id'].astype(str)
+X_test = []
+for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
+    img_path = os.path.join(TEST_DIR, row['filename'])
+    try:
+        img = load_img(img_path, target_size=IMG_SIZE)
+        img = img_to_array(img) / 255.0
+        X_test.append(img)
+    except Exception as e:
+        print(f"Error loading test image: {img_path} - {e}")
+
+X_test = np.array(X_test)
+
+predictions = model.predict(X_test)
+predicted_classes = np.argmax(predictions, axis=1)
+test_df['predicted_label'] = [index_to_label[i] for i in predicted_classes]
+
+test_df[['image_id', 'predicted_label']].to_csv('submission.csv', index=False)
